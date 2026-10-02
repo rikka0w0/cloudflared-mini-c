@@ -30,7 +30,7 @@ OPENSSL_LIBSSL := $(OPENSSL_PREFIX)/lib/libssl.a
 OPENSSL_LIBCRYPTO := $(OPENSSL_PREFIX)/lib/libcrypto.a
 OPENSSL_STAMP := $(OPENSSL_PREFIX)/.built
 
-SRC := src/main.c src/util.c src/capnp_minimal.c src/control_stream.c src/edge_h2.c
+SRC := src/main.c src/util.c src/capnp_minimal.c src/control_stream.c src/json_helper.c src/edge_h2.c
 BUILD_DIR := $(CURDIR)/.build/$(TARGET)
 OBJ := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRC))
 BIN := cloudflared-mini
