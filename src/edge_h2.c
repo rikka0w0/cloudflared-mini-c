@@ -19,8 +19,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define STREAM_QUEUE_HIGH (1024 * 1024)
-#define STREAM_QUEUE_LOW (512 * 1024)
+#define STREAM_QUEUE_HIGH (4 * 1024 * 1024)
+#define STREAM_QUEUE_LOW (1024 * 1024)
 #define EDGE_QUEUE_DRAIN_LIMIT (256 * 1024)
 #define TLS_QUEUE_HIGH (4 * 1024 * 1024)
 
@@ -43,11 +43,14 @@ static void handle_shutdown_signal(int signo) {
     g_shutdown_requested = 1;
 }
 
+typedef struct stream stream_t;
+
 typedef struct out_chunk {
     uint8_t *data;
     size_t len;
     size_t off;
     int eof;
+    stream_t *owner;
 } out_chunk_t;
 
 typedef struct q_chunk {
@@ -64,7 +67,7 @@ typedef struct {
     size_t bytes;
 } byte_queue_t;
 
-typedef struct stream {
+struct stream {
     int32_t id;
     stream_kind_t kind;
     h2_header_t headers[MAX_HEADERS];
@@ -74,6 +77,7 @@ typedef struct stream {
     int eof_sent;
     int origin_headers_done;
     int edge_eof_pending;
+    int edge_data_inflight;
     int http_is_ws;
     int http_has_content_length;
     size_t http_content_length;
@@ -92,7 +96,7 @@ typedef struct stream {
     uint8_t config_in[BUF_SIZE * 8];
     size_t config_in_len;
     struct stream *next;
-} stream_t;
+};
 
 typedef struct {
     SSL *ssl;
@@ -228,13 +232,15 @@ static ssize_t data_read_cb(nghttp2_session *session, int32_t stream_id, uint8_t
     if (c->off == c->len) {
         *data_flags |= NGHTTP2_DATA_FLAG_EOF;
         if (!c->eof) *data_flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
+        if (c->owner) c->owner->edge_data_inflight = 0;
         free(c->data);
         free(c);
     }
     return (ssize_t)left;
 }
 
-static int submit_data(h2_ctx_t *ctx, int32_t stream_id, const uint8_t *data, size_t len, int eof) {
+static int submit_data_owned(h2_ctx_t *ctx, int32_t stream_id, const uint8_t *data, size_t len,
+                             int eof, stream_t *owner) {
     out_chunk_t *c = calloc(1, sizeof(*c));
     if (!c) return -1;
     if (len) {
@@ -247,6 +253,7 @@ static int submit_data(h2_ctx_t *ctx, int32_t stream_id, const uint8_t *data, si
     }
     c->len = len;
     c->eof = eof;
+    c->owner = owner;
     nghttp2_data_provider prd = {.source.ptr = c, .read_callback = data_read_cb};
     int rv = nghttp2_submit_data(ctx->session, NGHTTP2_FLAG_NONE, stream_id, &prd);
     if (rv != 0) {
@@ -254,35 +261,34 @@ static int submit_data(h2_ctx_t *ctx, int32_t stream_id, const uint8_t *data, si
         free(c);
         return -1;
     }
+    if (owner) owner->edge_data_inflight = 1;
     return 0;
+}
+
+static int submit_data(h2_ctx_t *ctx, int32_t stream_id, const uint8_t *data, size_t len, int eof) {
+    return submit_data_owned(ctx, stream_id, data, len, eof, NULL);
 }
 
 static int submit_status_response_data(h2_ctx_t *ctx, stream_t *s, int status, const uint8_t *data,
                                        size_t len, int eof) {
-    out_chunk_t *c = calloc(1, sizeof(*c));
-    if (!c) return -1;
-    if (len) {
-        c->data = malloc(len);
-        if (!c->data) {
-            free(c);
-            return -1;
-        }
-        memcpy(c->data, data, len);
-    }
-    c->len = len;
-    c->eof = eof;
     char st[8];
     snprintf(st, sizeof(st), "%d", status);
     nghttp2_nv nva[] = {nv_lit(":status", st)};
-    nghttp2_data_provider prd = {.source.ptr = c, .read_callback = data_read_cb};
-    int rv = nghttp2_submit_response(ctx->session, s->id, nva, 1, &prd);
-    if (rv != 0) {
-        free(c->data);
-        free(c);
-        return -1;
+    if (!s->response_started) {
+        int end_stream = eof && len == 0;
+        int rv = nghttp2_submit_headers(ctx->session,
+                                        end_stream ? NGHTTP2_FLAG_END_STREAM : NGHTTP2_FLAG_NONE,
+                                        s->id, NULL, nva, 1, NULL);
+        if (rv != 0) return -1;
+        s->response_started = 1;
+        if (end_stream) {
+            s->eof_sent = 1;
+            return 0;
+        }
     }
-    s->response_started = 1;
-    s->eof_sent = eof;
+
+    if (len && queue_append(&s->to_edge, data, len, 0) != 0) return -1;
+    if (eof) s->edge_eof_pending = 1;
     return 0;
 }
 
@@ -792,8 +798,13 @@ static int on_frame_recv_cb(nghttp2_session *session, const nghttp2_frame *frame
 static int on_stream_close_cb(nghttp2_session *session, int32_t stream_id, uint32_t error_code,
                               void *user_data) {
     (void)session;
-    (void)error_code;
     h2_ctx_t *ctx = user_data;
+    stream_t *s = find_stream(ctx, stream_id);
+    if (s && s->kind != STREAM_CONFIG_UPDATE) {
+        fprintf(stderr, "stream %d closed by edge error=%u kind=%d to_origin=%zu to_edge=%zu inflight=%d\n",
+                stream_id, error_code, s->kind, s->to_origin.bytes, s->to_edge.bytes,
+                s->edge_data_inflight);
+    }
     remove_stream(ctx, stream_id);
     return 0;
 }
@@ -840,6 +851,8 @@ static int on_data_chunk_recv_cb(nghttp2_session *session, uint8_t flags, int32_
     } else if (s->kind == STREAM_HTTP && s->origin_fd >= 0) {
         s->h2_unconsumed += len;
         if (s->to_origin.bytes + len > STREAM_QUEUE_HIGH) {
+            fprintf(stderr, "stream %d origin queue overflow: queued=%zu incoming=%zu\n", s->id,
+                    s->to_origin.bytes, len);
             close(s->origin_fd);
             s->origin_fd = -1;
             maybe_consume_stream(ctx, s, 1);
@@ -898,6 +911,8 @@ static int on_data_chunk_recv_cb(nghttp2_session *session, uint8_t flags, int32_
                 if (s->kind == STREAM_WS && s->origin_fd >= 0) {
                     if (s->to_origin.bytes + (size_t)n > STREAM_QUEUE_HIGH ||
                         queue_append(&s->to_origin, plain, (size_t)n, 0) != 0) {
+                        fprintf(stderr, "stream %d websocket origin queue overflow: queued=%zu incoming=%zd\n",
+                                s->id, s->to_origin.bytes, n);
                         close(s->origin_fd);
                         s->origin_fd = -1;
                         break;
@@ -959,11 +974,11 @@ static int send_pending(h2_ctx_t *ctx) {
 static int drain_edge_queues(h2_ctx_t *ctx) {
     size_t submitted = 0;
     for (stream_t *s = ctx->streams; s && submitted < EDGE_QUEUE_DRAIN_LIMIT; s = s->next) {
-        while (s->to_edge.head && submitted < EDGE_QUEUE_DRAIN_LIMIT) {
+        while (!s->edge_data_inflight && s->to_edge.head && submitted < EDGE_QUEUE_DRAIN_LIMIT) {
             q_chunk_t *c = s->to_edge.head;
             size_t left = c->len - c->off;
             if (left > BUF_SIZE) left = BUF_SIZE;
-            if (submit_data(ctx, s->id, c->data + c->off, left, 0) != 0) {
+            if (submit_data_owned(ctx, s->id, c->data + c->off, left, 0, s) != 0) {
                 fprintf(stderr, "dropping edge queue for closed stream %d\n", s->id);
                 queue_clear(&s->to_edge);
                 s->edge_eof_pending = 0;
@@ -976,8 +991,8 @@ static int drain_edge_queues(h2_ctx_t *ctx) {
             queue_consume_head(&s->to_edge, left);
             submitted += left;
         }
-        if (!s->to_edge.head && s->edge_eof_pending && !s->eof_sent) {
-            if (submit_data(ctx, s->id, NULL, 0, 1) != 0) {
+        if (!s->edge_data_inflight && !s->to_edge.head && s->edge_eof_pending && !s->eof_sent) {
+            if (submit_data_owned(ctx, s->id, NULL, 0, 1, s) != 0) {
                 fprintf(stderr, "dropping EOF for closed stream %d\n", s->id);
                 s->edge_eof_pending = 0;
                 continue;
@@ -1091,7 +1106,7 @@ static int init_h2(h2_ctx_t *ctx) {
     nghttp2_session_callbacks_del(cb);
     if (rv != 0) return -1;
     nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 1024},
-                                   {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 1024 * 1024}};
+                                   {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 256 * 1024}};
     return nghttp2_submit_settings(ctx->session, NGHTTP2_FLAG_NONE, iv, 2);
 }
 
@@ -1122,7 +1137,7 @@ static void pump_origins(h2_ctx_t *ctx, struct pollfd *pfds, stream_t **poll_str
                                            &ws_ctx);
                 } else if (s->kind == STREAM_HTTP && !s->origin_headers_done) {
                     if (s->origin_in_len + (size_t)n > sizeof(s->origin_in)) {
-                        submit_data(ctx, s->id, NULL, 0, 1);
+                        send_response(ctx, s, 502, NULL, 0, 1);
                         s->eof_sent = 1;
                         close(s->origin_fd);
                         s->origin_fd = -1;
@@ -1179,22 +1194,25 @@ static void pump_origins(h2_ctx_t *ctx, struct pollfd *pfds, stream_t **poll_str
                     size_t send_len = (size_t)n < remaining ? (size_t)n : remaining;
                     s->http_body_sent += send_len;
                     int done = s->http_body_sent >= s->http_content_length;
-                    if (!s->response_started) {
-                        submit_status_response_data(ctx, s, s->http_status ? s->http_status : 200,
-                                                    buf, send_len, done);
-                    } else if (send_len || done) {
-                        submit_data(ctx, s->id, buf, send_len, done);
-                    }
+                    submit_status_response_data(ctx, s, s->http_status ? s->http_status : 200, buf,
+                                                send_len, done);
                     if (done) {
                         s->eof_sent = 1;
                         close(s->origin_fd);
                         s->origin_fd = -1;
                     }
                 } else if (queue_append(&s->to_edge, buf, (size_t)n, 0) != 0) {
+                    fprintf(stderr, "stream %d edge queue append failed: incoming=%zd\n", s->id, n);
                     close(s->origin_fd);
                     s->origin_fd = -1;
                 }
             } else if (!s->eof_sent) {
+                if (n < 0) {
+                    fprintf(stderr, "stream %d origin recv failed: errno=%d %s\n", s->id, errno,
+                            strerror(errno));
+                } else {
+                    fprintf(stderr, "stream %d origin EOF\n", s->id);
+                }
                 s->edge_eof_pending = 1;
                 close(s->origin_fd);
                 s->origin_fd = -1;
