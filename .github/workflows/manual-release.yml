@@ -1,0 +1,134 @@
+name: Manual release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Release tag name
+        required: true
+        default: v0.1.0
+      release_name:
+        description: Draft release title
+        required: true
+        default: cloudflared-mini-c
+
+permissions:
+  contents: write
+
+jobs:
+  build-x86_64:
+    name: Build linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static binary
+        run: |
+          make -j"$(nproc)" \
+            TARGET=x86_64-linux-gnu \
+            OPENSSL_TARGET=linux-x86_64 \
+            BIN=cloudflared-mini-linux-x86_64
+          strip cloudflared-mini-linux-x86_64
+          file cloudflared-mini-linux-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloudflared-mini-linux-x86_64
+          path: cloudflared-mini-linux-x86_64
+          if-no-files-found: error
+
+  build-x86:
+    name: Build linux x86
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static binary in i686 container
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            quay.io/pypa/manylinux_2_28_i686 \
+            /bin/bash -lc '
+              make -j"$(nproc)" \
+                TARGET=i686-linux-gnu \
+                OPENSSL_TARGET=linux-x86 \
+                BIN=cloudflared-mini-linux-x86
+              strip cloudflared-mini-linux-x86
+              file cloudflared-mini-linux-x86
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloudflared-mini-linux-x86
+          path: cloudflared-mini-linux-x86
+          if-no-files-found: error
+
+  build-mips32-be:
+    name: Build linux mips32 big-endian
+    runs-on: ubuntu-latest
+    env:
+      TOOLCHAIN_URL: https://downloads.openwrt.org/releases/25.12.5/targets/bmips/bcm63268/openwrt-toolchain-25.12.5-bmips-bcm63268_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download OpenWrt toolchain
+        run: |
+          mkdir -p "$RUNNER_TEMP/openwrt"
+          curl -L "$TOOLCHAIN_URL" -o "$RUNNER_TEMP/openwrt/toolchain.tar.zst"
+          tar --zstd -xf "$RUNNER_TEMP/openwrt/toolchain.tar.zst" -C "$RUNNER_TEMP/openwrt"
+          find "$RUNNER_TEMP/openwrt" -maxdepth 2 -type d -name 'openwrt-toolchain-*' -print
+
+      - name: Build static binary
+        run: |
+          TOOLCHAIN_DIR="$(find "$RUNNER_TEMP/openwrt" -maxdepth 1 -type d -name 'openwrt-toolchain-*' | head -n1)"
+          GCC_PATH="$(find "$TOOLCHAIN_DIR" -path '*/bin/*-openwrt-linux-musl-gcc' | head -n1)"
+          if [ -z "$GCC_PATH" ]; then
+            echo "Could not find OpenWrt musl gcc in $TOOLCHAIN_DIR" >&2
+            exit 1
+          fi
+          CROSS_COMPILE="${GCC_PATH%gcc}"
+          echo "Using CROSS_COMPILE=$CROSS_COMPILE"
+          STAGING_DIR="$TOOLCHAIN_DIR" \
+          make -j"$(nproc)" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            OPENSSL_TARGET=linux-mips32 \
+            BIN=cloudflared-mini-linux-mips32-be
+          "${CROSS_COMPILE}strip" cloudflared-mini-linux-mips32-be
+          file cloudflared-mini-linux-mips32-be
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloudflared-mini-linux-mips32-be
+          path: cloudflared-mini-linux-mips32-be
+          if-no-files-found: error
+
+  draft-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    needs:
+      - build-x86
+      - build-x86_64
+      - build-mips32-be
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release files
+        run: |
+          ls -lh dist
+          file dist/*
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          name: ${{ inputs.release_name }}
+          draft: true
+          prerelease: false
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist/cloudflared-mini-linux-x86
+            dist/cloudflared-mini-linux-x86_64
+            dist/cloudflared-mini-linux-mips32-be
