@@ -6,6 +6,8 @@
 #include <string.h>
 
 static const uint64_t REGISTRATION_SERVER_IID = 0xf71695ec7fe85497ULL;
+static const uint32_t REGISTER_ANSWER_ID = 1;
+static const uint32_t UNREGISTER_ANSWER_ID = 2;
 
 static void w16(uint8_t *p, uint16_t v) {
     p[0] = (uint8_t)v;
@@ -56,7 +58,7 @@ static int encode_call(const tunnel_auth_t *auth, const uint8_t *tunnel_id, size
     int call = capnp_alloc(&b, 6);
     if (call < 0) return -1;
     capnp_write_struct_ptr(b.buf, (size_t)msg + 8, (size_t)call, 3, 3);
-    w32(b.buf + call, 1);
+    w32(b.buf + call, REGISTER_ANSWER_ID);
     w16(b.buf + call + 4, 0);
     w64(b.buf + call + 8, REGISTRATION_SERVER_IID);
     size_t call_ptrs = (size_t)call + 24;
@@ -105,6 +107,42 @@ static int encode_call(const tunnel_auth_t *auth, const uint8_t *tunnel_id, size
     return *out_len ? 0 : -1;
 }
 
+static int encode_unregister_call(uint8_t *out, size_t out_cap, size_t *out_len) {
+    uint8_t work[512];
+    capnp_builder_t b;
+    capnp_builder_init(&b, work, sizeof(work));
+
+    int rp = capnp_alloc(&b, 1);
+    int msg = capnp_alloc(&b, 2);
+    if (rp < 0 || msg < 0) return -1;
+    capnp_write_struct_ptr(b.buf, (size_t)rp, (size_t)msg, 1, 1);
+    w16(b.buf + msg, 2);
+
+    int call = capnp_alloc(&b, 6);
+    if (call < 0) return -1;
+    capnp_write_struct_ptr(b.buf, (size_t)msg + 8, (size_t)call, 3, 3);
+    w32(b.buf + call, UNREGISTER_ANSWER_ID);
+    w16(b.buf + call + 4, 1);
+    w64(b.buf + call + 8, REGISTRATION_SERVER_IID);
+    size_t call_ptrs = (size_t)call + 24;
+
+    int target = capnp_alloc(&b, 2);
+    int pa = capnp_alloc(&b, 2);
+    if (target < 0 || pa < 0) return -1;
+    capnp_write_struct_ptr(b.buf, call_ptrs, (size_t)target, 1, 1);
+    w16(b.buf + target + 4, 1);
+    capnp_write_struct_ptr(b.buf, (size_t)target + 8, (size_t)pa, 1, 1);
+
+    int payload = capnp_alloc(&b, 2);
+    int params = capnp_alloc(&b, 0);
+    if (payload < 0 || params < 0) return -1;
+    capnp_write_struct_ptr(b.buf, call_ptrs + 8, (size_t)payload, 0, 2);
+    capnp_write_struct_ptr(b.buf, (size_t)payload, (size_t)params, 0, 0);
+
+    *out_len = capnp_finalize(&b, out, out_cap);
+    return *out_len ? 0 : -1;
+}
+
 int control_stream_encode_register(const tunnel_auth_t *auth, const uint8_t *tunnel_id,
                                    size_t tunnel_id_len, uint8_t conn_index,
                                    const conn_options_t *options, uint8_t *buf,
@@ -116,6 +154,10 @@ int control_stream_encode_register(const tunnel_auth_t *auth, const uint8_t *tun
         return -1;
     *out_len = a + b;
     return 0;
+}
+
+int control_stream_encode_unregister(uint8_t *buf, size_t buf_cap, size_t *out_len) {
+    return encode_unregister_call(buf, buf_cap, out_len);
 }
 
 int control_stream_decode_response(const uint8_t *data, size_t len, registration_result_t *result) {
@@ -131,11 +173,20 @@ int control_stream_decode_response(const uint8_t *data, size_t len, registration
     if (capnp_read_struct_ptr(&reader, root_off + root_dw * 8, &ret_off, &ret_dw, &ret_pc) != 0)
         return -1;
     uint32_t answer_id = ret_dw ? r32(reader.seg + ret_off) : 0;
+    result->answer_id = answer_id;
     if (answer_id == 0) {
         result->is_bootstrap = true;
         return 0;
     }
     uint16_t ret_which = ret_dw ? capnp_read_uint16(&reader, ret_off, 6) : 0;
+    if (answer_id == UNREGISTER_ANSWER_ID) {
+        result->unregister_ack = ret_which == 0;
+        result->success = result->unregister_ack;
+        if (ret_which != 0) {
+            snprintf(result->error, sizeof(result->error), "unregister return type %u", ret_which);
+        }
+        return 0;
+    }
     size_t ret_ptrs = ret_off + ret_dw * 8;
     if (ret_which != 0) {
         snprintf(result->error, sizeof(result->error), "registration return type %u", ret_which);
@@ -182,4 +233,3 @@ int control_stream_decode_response(const uint8_t *data, size_t len, registration
     result->success = true;
     return 0;
 }
-

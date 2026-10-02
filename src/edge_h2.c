@@ -19,6 +19,13 @@
 
 typedef enum { STREAM_NEW, STREAM_CONTROL, STREAM_HTTP, STREAM_WS, STREAM_REJECT } stream_kind_t;
 
+static volatile sig_atomic_t g_shutdown_requested = 0;
+
+static void handle_shutdown_signal(int signo) {
+    (void)signo;
+    g_shutdown_requested = 1;
+}
+
 typedef struct out_chunk {
     uint8_t *data;
     size_t len;
@@ -57,6 +64,9 @@ typedef struct {
     tunnel_token_t token;
     uint8_t client_id[16];
     stream_t *streams;
+    int32_t control_stream_id;
+    int registered;
+    int unregister_acked;
     int stopping;
 } h2_ctx_t;
 
@@ -350,6 +360,7 @@ static int start_stream(h2_ctx_t *ctx, stream_t *s) {
 
     if (internal && strcasecmp(internal, "control-stream") == 0) {
         s->kind = STREAM_CONTROL;
+        ctx->control_stream_id = s->id;
         if (send_response(ctx, s, 200, NULL, 0, 0) != 0) return -1;
         tunnel_auth_t auth = {.account_tag = ctx->token.account_tag,
                               .tunnel_secret = ctx->token.tunnel_secret,
@@ -488,8 +499,14 @@ static int on_data_chunk_recv_cb(nghttp2_session *session, uint8_t flags, int32_
                 if (rr.is_bootstrap) {
                     fprintf(stderr, "control stream: bootstrap acknowledged\n");
                 } else if (rr.success) {
-                    fprintf(stderr, "registered: uuid=%s location=%s remote=%d\n", rr.uuid,
-                            rr.location, rr.tunnel_is_remote);
+                    if (rr.unregister_ack) {
+                        ctx->unregister_acked = 1;
+                        fprintf(stderr, "unregistered tunnel connection\n");
+                    } else {
+                        ctx->registered = 1;
+                        fprintf(stderr, "registered: uuid=%s location=%s remote=%d\n", rr.uuid,
+                                rr.location, rr.tunnel_is_remote);
+                    }
                 } else {
                     fprintf(stderr, "registration error: %s retry=%d\n", rr.error, rr.should_retry);
                 }
@@ -540,6 +557,55 @@ static int send_pending(h2_ctx_t *ctx) {
             off += (size_t)n;
         }
     }
+}
+
+static void recv_edge_once(h2_ctx_t *ctx, SSL *ssl) {
+    uint8_t buf[BUF_SIZE];
+    int n = SSL_read(ssl, buf, sizeof(buf));
+    if (n > 0) {
+        ssize_t rv = nghttp2_session_mem_recv(ctx->session, buf, (size_t)n);
+        if (rv < 0) {
+            fprintf(stderr, "nghttp2 recv error during shutdown: %s\n", nghttp2_strerror((int)rv));
+            ctx->stopping = 1;
+        }
+    }
+}
+
+static void graceful_shutdown_control(h2_ctx_t *ctx, int edge_fd) {
+    if (!ctx->registered || ctx->control_stream_id <= 0) return;
+
+    uint8_t msg[512];
+    size_t msg_len = 0;
+    if (control_stream_encode_unregister(msg, sizeof(msg), &msg_len) != 0) {
+        fprintf(stderr, "failed to encode unregister RPC\n");
+        return;
+    }
+
+    fprintf(stderr, "control stream: sending unregister (%zu bytes)\n", msg_len);
+    if (submit_data(ctx, ctx->control_stream_id, msg, msg_len, 0) != 0 || send_pending(ctx) != 0) {
+        fprintf(stderr, "failed to send unregister RPC\n");
+        return;
+    }
+
+    for (int waited_ms = 0; waited_ms < 5000 && !ctx->unregister_acked; waited_ms += 100) {
+        struct pollfd pfd;
+        pfd.fd = edge_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, 100);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) recv_edge_once(ctx, ctx->ssl);
+        if (send_pending(ctx) != 0) break;
+    }
+
+    if (!ctx->unregister_acked) fprintf(stderr, "unregister sent; closing edge connection\n");
+
+    submit_data(ctx, ctx->control_stream_id, NULL, 0, 1);
+    nghttp2_submit_goaway(ctx->session, NGHTTP2_FLAG_NONE, 0, NGHTTP2_NO_ERROR, NULL, 0);
+    send_pending(ctx);
 }
 
 static int tls_connect_edge(SSL_CTX **out_ctx, SSL **out_ssl) {
@@ -694,6 +760,8 @@ int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count
     SSL_library_init();
     SSL_load_error_strings();
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, handle_shutdown_signal);
+    signal(SIGTERM, handle_shutdown_signal);
 
     SSL_CTX *ssl_ctx = NULL;
     SSL *ssl = NULL;
@@ -710,11 +778,16 @@ int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count
     ctx.routes = routes;
     ctx.route_count = route_count;
     ctx.token = *token;
+    ctx.control_stream_id = -1;
     uuid_v4(ctx.client_id);
     if (init_h2(&ctx) != 0) return 1;
     send_pending(&ctx);
 
     while (!ctx.stopping) {
+        if (g_shutdown_requested) {
+            ctx.stopping = 1;
+            break;
+        }
         int count = 1;
         for (stream_t *s = ctx.streams; s && count < 256; s = s->next)
             if (s->origin_fd >= 0) count++;
@@ -752,6 +825,8 @@ int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count
         if (send_pending(&ctx) != 0) break;
     }
 
+    if (g_shutdown_requested) graceful_shutdown_control(&ctx, edge_fd);
+    SSL_shutdown(ssl);
     nghttp2_session_del(ctx.session);
     SSL_free(ssl);
     SSL_CTX_free(ssl_ctx);

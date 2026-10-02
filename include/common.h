@@ -53,8 +53,10 @@ typedef struct {
 typedef struct {
     bool success;
     bool is_bootstrap;
+    bool unregister_ack;
     bool tunnel_is_remote;
     bool should_retry;
+    uint32_t answer_id;
     int64_t retry_after_ns;
     char uuid[64];
     char location[32];
