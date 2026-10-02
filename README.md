@@ -2,19 +2,23 @@
 
 Minimal Linux `cloudflared tunnel --protocol http2 run` client in C.
 
-Supported routes:
+Run:
 
 ```sh
-./cloudflared-mini tunnel --protocol http2 run --token TOKEN \
-  --websockify domain.example:127.0.0.1:22 \
-  --http app.example:127.0.0.1:8080
+./cloudflared-mini tunnel --protocol http2 run --token TOKEN --websockify websockify
 ```
 
-`--websockify` accepts only WebSocket upgrade requests and bridges WebSocket
-binary frames to the configured TCP endpoint.
+Routes come from the Cloudflare-managed tunnel configuration.
 
-`--http` proxies requests to an HTTP/1.1 origin. WebSocket upgrade requests are
-passed through to the origin server.
+Supported `service` schemes:
+
+- `http://host:port`: proxy HTTP requests to an HTTP/1.1 origin. WebSocket
+  upgrade requests are passed through to the origin server.
+
+When `--websockify PATH` is set, `/<PATH>/<host>/<port>` is checked before the
+HTTP origin. If it is a WebSocket upgrade request, WebSocket binary frames are
+bridged to the requested TCP endpoint. Non-WebSocket requests under that path
+return 404.
 
 For binary protocols such as SSH over WebSocket, use `websocat --binary`; `-t`
 forces text frames and corrupts binary SSH packets.

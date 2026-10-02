@@ -17,8 +17,7 @@
 #define BUF_SIZE 16384
 
 typedef enum {
-    ROUTE_WEBSOCKIFY = 1,
-    ROUTE_HTTP = 2,
+    ROUTE_HTTP = 1,
 } route_method_t;
 
 typedef struct {
@@ -45,6 +44,8 @@ typedef struct {
     const uint8_t *client_id;
     const char *version;
     const char *arch;
+    const char *const *features;
+    size_t feature_count;
     bool replace_existing;
     uint8_t compression_quality;
     uint8_t num_previous_attempts;

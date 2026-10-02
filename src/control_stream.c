@@ -42,6 +42,21 @@ static int encode_bootstrap(uint8_t *out, size_t out_cap, size_t *out_len) {
     return *out_len ? 0 : -1;
 }
 
+static int write_text_list(capnp_builder_t *b, size_t ptr_offset, const char *const *items,
+                           size_t count) {
+    if (!items || count == 0) {
+        memset(b->buf + ptr_offset, 0, 8);
+        return 0;
+    }
+    int list = capnp_alloc(b, count);
+    if (list < 0) return -1;
+    capnp_write_list_ptr(b->buf, ptr_offset, (size_t)list, 6, (uint32_t)count);
+    for (size_t i = 0; i < count; i++) {
+        if (capnp_write_text(b, (size_t)list + i * 8, items[i]) != 0) return -1;
+    }
+    return 0;
+}
+
 static int encode_call(const tunnel_auth_t *auth, const uint8_t *tunnel_id, size_t tunnel_id_len,
                        uint8_t conn_index, const conn_options_t *options, uint8_t *out,
                        size_t out_cap, size_t *out_len) {
@@ -98,6 +113,8 @@ static int encode_call(const tunnel_auth_t *auth, const uint8_t *tunnel_id, size
         if (ci < 0) return -1;
         capnp_write_struct_ptr(b.buf, co_ptrs, (size_t)ci, 0, 4);
         if (options->client_id && capnp_write_data(&b, (size_t)ci, options->client_id, 16) != 0)
+            return -1;
+        if (write_text_list(&b, (size_t)ci + 8, options->features, options->feature_count) != 0)
             return -1;
         if (capnp_write_text(&b, (size_t)ci + 16, options->version) != 0) return -1;
         if (capnp_write_text(&b, (size_t)ci + 24, options->arch) != 0) return -1;

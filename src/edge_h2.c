@@ -17,7 +17,16 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-typedef enum { STREAM_NEW, STREAM_CONTROL, STREAM_HTTP, STREAM_WS, STREAM_REJECT } stream_kind_t;
+typedef enum {
+    STREAM_NEW,
+    STREAM_CONTROL,
+    STREAM_CONFIG_UPDATE,
+    STREAM_HTTP,
+    STREAM_WS,
+    STREAM_REJECT
+} stream_kind_t;
+
+static const char *const DEFAULT_FEATURES[] = {"allow_remote_config"};
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
@@ -53,6 +62,8 @@ typedef struct stream {
     size_t origin_in_len;
     uint8_t ctrl_in[BUF_SIZE * 4];
     size_t ctrl_in_len;
+    uint8_t config_in[BUF_SIZE * 8];
+    size_t config_in_len;
     struct stream *next;
 } stream_t;
 
@@ -61,6 +72,9 @@ typedef struct {
     nghttp2_session *session;
     route_t *routes;
     size_t route_count;
+    size_t route_capacity;
+    int32_t config_version;
+    const char *websockify_path;
     tunnel_token_t token;
     uint8_t client_id[16];
     stream_t *streams;
@@ -283,6 +297,203 @@ static int parse_http_status(stream_t *s, const char *headers) {
     return status;
 }
 
+static int parse_websockify_path(const char *path, const char *prefix, char *host, size_t host_len,
+                                 char *port, size_t port_len) {
+    if (!path || !prefix || !*prefix) return 0;
+    if (*path != '/') return 0;
+    path++;
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(path, prefix, prefix_len) != 0) return 0;
+    path += prefix_len;
+    if (*path != '/') return 0;
+    path++;
+
+    const char *slash = strchr(path, '/');
+    if (!slash || slash == path) return -1;
+    size_t hlen = (size_t)(slash - path);
+    if (hlen >= host_len) return -1;
+    memcpy(host, path, hlen);
+    host[hlen] = 0;
+
+    const char *p = slash + 1;
+    const char *end = p;
+    while (*end && *end != '/' && *end != '?' && *end != '#') end++;
+    if (end == p) return -1;
+    size_t plen = (size_t)(end - p);
+    if (plen >= port_len) return -1;
+    memcpy(port, p, plen);
+    port[plen] = 0;
+    return 1;
+}
+
+static const char *skip_ws(const char *p, const char *end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    return p;
+}
+
+static const char *find_json_key(const char *start, const char *end, const char *key) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    size_t pat_len = strlen(pat);
+    for (const char *p = start; p + pat_len <= end; p++) {
+        if (memcmp(p, pat, pat_len) == 0) return p + pat_len;
+    }
+    return NULL;
+}
+
+static int json_string_in_range(const char *start, const char *end, const char *key, char *out,
+                                size_t out_cap) {
+    const char *p = find_json_key(start, end, key);
+    if (!p) return -1;
+    p = memchr(p, ':', (size_t)(end - p));
+    if (!p) return -1;
+    p = skip_ws(p + 1, end);
+    if (p >= end || *p != '"') return -1;
+    p++;
+    size_t n = 0;
+    while (p < end && *p != '"') {
+        if (*p == '\\' && p + 1 < end) p++;
+        if (n + 1 < out_cap) out[n++] = *p;
+        p++;
+    }
+    if (p >= end || *p != '"') return -1;
+    out[n] = 0;
+    return 0;
+}
+
+static int json_int_in_range(const char *start, const char *end, const char *key, int *out) {
+    const char *p = find_json_key(start, end, key);
+    if (!p) return -1;
+    p = memchr(p, ':', (size_t)(end - p));
+    if (!p) return -1;
+    p = skip_ws(p + 1, end);
+    if (p >= end) return -1;
+    *out = atoi(p);
+    return 0;
+}
+
+static const char *json_matching(const char *p, const char *end, char open, char close) {
+    int depth = 0;
+    int in_str = 0;
+    int esc = 0;
+    for (; p < end; p++) {
+        if (in_str) {
+            if (esc) esc = 0;
+            else if (*p == '\\') esc = 1;
+            else if (*p == '"') in_str = 0;
+            continue;
+        }
+        if (*p == '"') in_str = 1;
+        else if (*p == open) depth++;
+        else if (*p == close) {
+            depth--;
+            if (depth == 0) return p + 1;
+        }
+    }
+    return NULL;
+}
+
+static int parse_service_url(const char *service, route_t *r) {
+    const char *scheme_end = strstr(service, "://");
+    if (!scheme_end) return -1;
+    size_t scheme_len = (size_t)(scheme_end - service);
+    if (scheme_len == 4 && strncasecmp(service, "http", 4) == 0) {
+        r->method = ROUTE_HTTP;
+    } else {
+        return -1;
+    }
+
+    const char *hp = scheme_end + 3;
+    const char *path = strchr(hp, '/');
+    size_t hp_len = path ? (size_t)(path - hp) : strlen(hp);
+    if (hp_len == 0 || hp_len >= 300) return -1;
+
+    const char *colon = NULL;
+    for (const char *p = hp; p < hp + hp_len; p++) {
+        if (*p == ':') colon = p;
+    }
+    size_t host_len = colon ? (size_t)(colon - hp) : hp_len;
+    if (host_len == 0 || host_len >= sizeof(r->host)) return -1;
+    memcpy(r->host, hp, host_len);
+    r->host[host_len] = 0;
+
+    const char *port = NULL;
+    char default_port[4];
+    if (colon && colon + 1 < hp + hp_len) {
+        port = colon + 1;
+        size_t port_len = (size_t)(hp + hp_len - port);
+        if (port_len == 0 || port_len >= sizeof(r->port)) return -1;
+        memcpy(r->port, port, port_len);
+        r->port[port_len] = 0;
+    } else {
+        snprintf(default_port, sizeof(default_port), "%d", 80);
+        snprintf(r->port, sizeof(r->port), "%s", default_port);
+    }
+    return 0;
+}
+
+static int apply_remote_config(h2_ctx_t *ctx, const uint8_t *data, size_t len, int *version_out,
+                               char *err, size_t err_len) {
+    const char *json = (const char *)data;
+    const char *end = json + len;
+    int version = 0;
+    json_int_in_range(json, end, "version", &version);
+    if (version_out) *version_out = version;
+
+    const char *ing = find_json_key(json, end, "ingress");
+    if (!ing) {
+        snprintf(err, err_len, "missing ingress");
+        return -1;
+    }
+    ing = memchr(ing, '[', (size_t)(end - ing));
+    if (!ing) {
+        snprintf(err, err_len, "missing ingress array");
+        return -1;
+    }
+    const char *arr_end = json_matching(ing, end, '[', ']');
+    if (!arr_end) {
+        snprintf(err, err_len, "unterminated ingress array");
+        return -1;
+    }
+
+    route_t next[MAX_ROUTES];
+    size_t next_count = 0;
+    const char *p = ing + 1;
+    while (p < arr_end) {
+        p = skip_ws(p, arr_end);
+        if (p >= arr_end || *p == ']') break;
+        if (*p != '{') {
+            p++;
+            continue;
+        }
+        const char *obj_end = json_matching(p, arr_end, '{', '}');
+        if (!obj_end) break;
+
+        char hostname[256] = {0};
+        char service[512] = {0};
+        if (json_string_in_range(p, obj_end, "service", service, sizeof(service)) == 0 &&
+            json_string_in_range(p, obj_end, "hostname", hostname, sizeof(hostname)) == 0) {
+            route_t r;
+            memset(&r, 0, sizeof(r));
+            snprintf(r.domain, sizeof(r.domain), "%s", hostname);
+            if (parse_service_url(service, &r) == 0) {
+                if (next_count < ctx->route_capacity) {
+                    next[next_count++] = r;
+                    fprintf(stderr, "remote route: %s -> http://%s:%s\n", r.domain, r.host,
+                            r.port);
+                }
+            }
+        }
+        p = obj_end;
+    }
+
+    memcpy(ctx->routes, next, next_count * sizeof(next[0]));
+    ctx->route_count = next_count;
+    ctx->config_version = version;
+    fprintf(stderr, "applied remote config version=%d routes=%zu\n", version, next_count);
+    return 0;
+}
+
 static void append_origin_request_header(char *buf, size_t cap, size_t *pos, const char *name,
                                          const char *value) {
     if (!name || !value || !*name) return;
@@ -357,6 +568,7 @@ static int start_stream(h2_ctx_t *ctx, stream_t *s) {
     char *internal = header_value(s->headers, s->header_count, HEADER_UPGRADE);
     char *host = header_value(s->headers, s->header_count, ":authority");
     if (!host) host = header_value(s->headers, s->header_count, "host");
+    char *path = header_value(s->headers, s->header_count, ":path");
 
     if (internal && strcasecmp(internal, "control-stream") == 0) {
         s->kind = STREAM_CONTROL;
@@ -368,6 +580,8 @@ static int start_stream(h2_ctx_t *ctx, stream_t *s) {
         conn_options_t opts = {.client_id = ctx->client_id,
                                .version = MINI_VERSION,
                                .arch = "linux",
+                               .features = DEFAULT_FEATURES,
+                               .feature_count = sizeof(DEFAULT_FEATURES) / sizeof(DEFAULT_FEATURES[0]),
                                .compression_quality = 0,
                                .replace_existing = false,
                                .num_previous_attempts = 0};
@@ -382,11 +596,29 @@ static int start_stream(h2_ctx_t *ctx, stream_t *s) {
         return submit_data(ctx, s->id, reg, reg_len, 0);
     }
 
-    if (internal && strcasecmp(internal, "websocket") == 0) {
-        const route_t *r = find_route(ctx->routes, ctx->route_count, host, ROUTE_WEBSOCKIFY);
-        char *key = header_value(s->headers, s->header_count, "sec-websocket-key");
-        if (r && key) {
-            s->origin_fd = tcp_connect_host(r->host, r->port);
+    if (internal && strcasecmp(internal, "update-configuration") == 0) {
+        s->kind = STREAM_CONFIG_UPDATE;
+        fprintf(stderr, "configuration update stream %d opened\n", s->id);
+        return send_response(ctx, s, 200, NULL, 0, 0);
+    }
+
+    int ws_mode = internal && strcasecmp(internal, "websocket") == 0;
+    const route_t *hr = find_route(ctx->routes, ctx->route_count, host, ROUTE_HTTP);
+    if (hr) {
+        char ws_host[256], ws_port[16];
+        int ws_path = parse_websockify_path(path, ctx->websockify_path, ws_host, sizeof(ws_host),
+                                            ws_port, sizeof(ws_port));
+        if (ws_path != 0) {
+            if (ws_path < 0 || !ws_mode) {
+                s->kind = STREAM_REJECT;
+                return send_response(ctx, s, 404, NULL, 0, 1);
+            }
+            char *key = header_value(s->headers, s->header_count, "sec-websocket-key");
+            if (!key) {
+                s->kind = STREAM_REJECT;
+                return send_response(ctx, s, 404, NULL, 0, 1);
+            }
+            s->origin_fd = tcp_connect_host(ws_host, ws_port);
             if (s->origin_fd < 0) {
                 s->kind = STREAM_REJECT;
                 return send_response(ctx, s, 502, NULL, 0, 1);
@@ -398,14 +630,11 @@ static int start_stream(h2_ctx_t *ctx, stream_t *s) {
                                   nv_lit("upgrade", "websocket"),
                                   nv_lit("sec-websocket-accept", accept)};
             s->kind = STREAM_WS;
-            fprintf(stderr, "websockify stream %d: %s -> %s:%s\n", s->id, r->domain, r->host, r->port);
+            fprintf(stderr, "websockify path stream %d: /%s -> %s:%s\n", s->id,
+                    ctx->websockify_path, ws_host, ws_port);
             return send_response(ctx, s, 200, extra, 3, 0);
         }
-    }
 
-    int ws_mode = internal && strcasecmp(internal, "websocket") == 0;
-    const route_t *hr = find_route(ctx->routes, ctx->route_count, host, ROUTE_HTTP);
-    if (hr) {
         s->origin_fd = tcp_connect_host(hr->host, hr->port);
         if (s->origin_fd < 0) {
             s->kind = STREAM_REJECT;
@@ -516,6 +745,29 @@ static int on_data_chunk_recv_cb(nghttp2_session *session, uint8_t flags, int32_
         }
     } else if (s->kind == STREAM_HTTP && s->origin_fd >= 0) {
         send(s->origin_fd, data, len, MSG_NOSIGNAL);
+    } else if (s->kind == STREAM_CONFIG_UPDATE) {
+        if (s->config_in_len + len > sizeof(s->config_in)) {
+            fprintf(stderr, "configuration update too large; dropping buffer\n");
+            s->config_in_len = 0;
+            return 0;
+        }
+        memcpy(s->config_in + s->config_in_len, data, len);
+        s->config_in_len += len;
+        if (flags & NGHTTP2_FLAG_END_STREAM) {
+            int version = 0;
+            char err[256] = {0};
+            int ok = apply_remote_config(ctx, s->config_in, s->config_in_len, &version, err,
+                                         sizeof(err)) == 0;
+            char resp[384];
+            if (ok) {
+                snprintf(resp, sizeof(resp), "{\"latestAppliedVersion\":%d,\"err\":\"\"}\n",
+                         version);
+            } else {
+                snprintf(resp, sizeof(resp), "{\"latestAppliedVersion\":%d,\"err\":\"%s\"}\n",
+                         ctx->config_version, err);
+            }
+            submit_data(ctx, s->id, (const uint8_t *)resp, strlen(resp), 1);
+        }
     } else if (s->kind == STREAM_WS && s->origin_fd >= 0) {
         if (s->ws_in_len + len > sizeof(s->ws_in)) {
             s->ws_in_len = 0;
@@ -756,7 +1008,8 @@ static void pump_origins(h2_ctx_t *ctx, struct pollfd *pfds, int base, int nfds)
     }
 }
 
-int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count) {
+int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count,
+                const char *websockify_path) {
     SSL_library_init();
     SSL_load_error_strings();
     signal(SIGPIPE, SIG_IGN);
@@ -777,7 +1030,9 @@ int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count
     ctx.ssl = ssl;
     ctx.routes = routes;
     ctx.route_count = route_count;
+    ctx.route_capacity = MAX_ROUTES;
     ctx.token = *token;
+    ctx.websockify_path = websockify_path;
     ctx.control_stream_id = -1;
     uuid_v4(ctx.client_id);
     if (init_h2(&ctx) != 0) return 1;
