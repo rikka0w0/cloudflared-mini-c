@@ -5,7 +5,16 @@
 #include <string.h>
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "usage: %s tunnel --protocol http2 run --token TOKEN [--websockify PATH]\n", argv0);
+    fprintf(stderr, "usage: %s tunnel --protocol http2 run --token TOKEN [--websockify PATH] [--vless PATH]\n", argv0);
+}
+
+static int normalize_path_arg(const char *name, const char **path) {
+    if ((*path)[0] == '/') (*path)++;
+    if (!**path || strchr(*path, '/')) {
+        fprintf(stderr, "invalid %s path\n", name);
+        return -1;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -17,6 +26,7 @@ int main(int argc, char **argv) {
 
     const char *token_s = NULL;
     const char *websockify_path = NULL;
+    const char *vless_path = NULL;
     route_t routes[MAX_ROUTES];
     size_t route_count = 0;
 
@@ -25,11 +35,10 @@ int main(int argc, char **argv) {
             token_s = argv[++i];
         } else if (strcmp(argv[i], "--websockify") == 0 && i + 1 < argc) {
             websockify_path = argv[++i];
-            if (websockify_path[0] == '/') websockify_path++;
-            if (!*websockify_path || strchr(websockify_path, '/')) {
-                fprintf(stderr, "invalid --websockify path\n");
-                return 2;
-            }
+            if (normalize_path_arg("--websockify", &websockify_path) != 0) return 2;
+        } else if (strcmp(argv[i], "--vless") == 0 && i + 1 < argc) {
+            vless_path = argv[++i];
+            if (normalize_path_arg("--vless", &vless_path) != 0) return 2;
         } else {
             usage(argv[0]);
             return 2;
@@ -47,5 +56,5 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "loaded token: account=%s secret_len=%zu\n", token.account_tag,
             token.tunnel_secret_len);
-    return run_edge_h2(&token, routes, route_count, websockify_path);
+    return run_edge_h2(&token, routes, route_count, websockify_path, vless_path);
 }

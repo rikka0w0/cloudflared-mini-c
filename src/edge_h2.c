@@ -3,6 +3,7 @@
 #include "control_stream.h"
 #include "json_helper.h"
 #include "util.h"
+#include "vless.h"
 
 #include <errno.h>
 #include <ctype.h>
@@ -18,12 +19,18 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define STREAM_QUEUE_HIGH (1024 * 1024)
+#define STREAM_QUEUE_LOW (512 * 1024)
+#define EDGE_QUEUE_DRAIN_LIMIT (256 * 1024)
+#define TLS_QUEUE_HIGH (4 * 1024 * 1024)
+
 typedef enum {
     STREAM_NEW,
     STREAM_CONTROL,
     STREAM_CONFIG_UPDATE,
     STREAM_HTTP,
     STREAM_WS,
+    STREAM_VLESS,
     STREAM_REJECT
 } stream_kind_t;
 
@@ -43,6 +50,20 @@ typedef struct out_chunk {
     int eof;
 } out_chunk_t;
 
+typedef struct q_chunk {
+    uint8_t *data;
+    size_t len;
+    size_t off;
+    int datagram;
+    struct q_chunk *next;
+} q_chunk_t;
+
+typedef struct {
+    q_chunk_t *head;
+    q_chunk_t *tail;
+    size_t bytes;
+} byte_queue_t;
+
 typedef struct stream {
     int32_t id;
     stream_kind_t kind;
@@ -52,13 +73,18 @@ typedef struct stream {
     int response_started;
     int eof_sent;
     int origin_headers_done;
+    int edge_eof_pending;
     int http_is_ws;
     int http_has_content_length;
     size_t http_content_length;
     size_t http_body_sent;
     int http_status;
+    size_t h2_unconsumed;
     uint8_t ws_in[BUF_SIZE * 4];
     size_t ws_in_len;
+    vless_stream_t vless;
+    byte_queue_t to_origin;
+    byte_queue_t to_edge;
     uint8_t origin_in[BUF_SIZE * 4];
     size_t origin_in_len;
     uint8_t ctrl_in[BUF_SIZE * 4];
@@ -76,14 +102,75 @@ typedef struct {
     size_t route_capacity;
     int32_t config_version;
     const char *websockify_path;
+    const char *vless_path;
     tunnel_token_t token;
     uint8_t client_id[16];
     stream_t *streams;
+    byte_queue_t tls_out;
     int32_t control_stream_id;
     int registered;
     int unregister_acked;
     int stopping;
 } h2_ctx_t;
+
+static void queue_clear(byte_queue_t *q) {
+    q_chunk_t *c = q->head;
+    while (c) {
+        q_chunk_t *next = c->next;
+        free(c->data);
+        free(c);
+        c = next;
+    }
+    memset(q, 0, sizeof(*q));
+}
+
+static int queue_append(byte_queue_t *q, const uint8_t *data, size_t len, int datagram) {
+    if (!len) return 0;
+    q_chunk_t *c = calloc(1, sizeof(*c));
+    if (!c) return -1;
+    c->data = malloc(len);
+    if (!c->data) {
+        free(c);
+        return -1;
+    }
+    memcpy(c->data, data, len);
+    c->len = len;
+    c->datagram = datagram;
+    if (q->tail) q->tail->next = c;
+    else q->head = c;
+    q->tail = c;
+    q->bytes += len;
+    return 0;
+}
+
+static void queue_consume_head(byte_queue_t *q, size_t n) {
+    q_chunk_t *c = q->head;
+    if (!c || n == 0) return;
+    c->off += n;
+    q->bytes -= n;
+    if (c->off >= c->len) {
+        q->head = c->next;
+        if (!q->head) q->tail = NULL;
+        free(c->data);
+        free(c);
+    }
+}
+
+static int queue_flush_fd(byte_queue_t *q, int fd) {
+    while (q->head) {
+        q_chunk_t *c = q->head;
+        size_t left = c->len - c->off;
+        ssize_t n = send(fd, c->data + c->off, left, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
+            return -1;
+        }
+        if (n == 0) return 0;
+        if (c->datagram && (size_t)n != left) return -1;
+        queue_consume_head(q, (size_t)n);
+    }
+    return 0;
+}
 
 static nghttp2_nv nv_lit(const char *name, const char *value) {
     nghttp2_nv nv;
@@ -118,6 +205,8 @@ static void remove_stream(h2_ctx_t *ctx, int32_t id) {
         if (s->id == id) {
             *pp = s->next;
             if (s->origin_fd >= 0) close(s->origin_fd);
+            queue_clear(&s->to_origin);
+            queue_clear(&s->to_edge);
             free(s);
             return;
         }
@@ -210,6 +299,15 @@ static int send_response(h2_ctx_t *ctx, stream_t *s, int status, nghttp2_nv *ext
     s->response_started = 1;
     s->eof_sent = end_stream;
     return rv == 0 ? 0 : -1;
+}
+
+static int maybe_consume_stream(h2_ctx_t *ctx, stream_t *s, int force) {
+    if (!s->h2_unconsumed) return 0;
+    if (!force && s->to_origin.bytes >= STREAM_QUEUE_LOW) return 0;
+    int rv = nghttp2_session_consume(ctx->session, s->id, s->h2_unconsumed);
+    if (rv != 0) return -1;
+    s->h2_unconsumed = 0;
+    return 0;
 }
 
 static int build_h2_headers_from_http(stream_t *s, char *headers, int ws_mode, nghttp2_nv *nva,
@@ -325,6 +423,15 @@ static int parse_websockify_path(const char *path, const char *prefix, char *hos
     memcpy(port, p, plen);
     port[plen] = 0;
     return 1;
+}
+
+static int path_matches_prefix(const char *path, const char *prefix) {
+    if (!path || !prefix || !*prefix || *path != '/') return 0;
+    path++;
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(path, prefix, prefix_len) != 0) return 0;
+    char next = path[prefix_len];
+    return next == 0 || next == '/' || next == '?' || next == '#';
 }
 
 static const char *skip_ws(const char *p, const char *end) {
@@ -478,7 +585,7 @@ static int send_http_origin_request(stream_t *s, int ws_mode) {
     if (pos + 2 >= sizeof(req)) return -1;
     memcpy(req + pos, "\r\n", 2);
     pos += 2;
-    return send(s->origin_fd, req, pos, MSG_NOSIGNAL) == (ssize_t)pos ? 0 : -1;
+    return queue_append(&s->to_origin, (const uint8_t *)req, pos, 0);
 }
 
 static int encode_ws_binary(const uint8_t *data, size_t len, uint8_t **out, size_t *out_len) {
@@ -501,6 +608,32 @@ static int encode_ws_binary(const uint8_t *data, size_t len, uint8_t **out, size
     *out = b;
     *out_len = hdr + len;
     return 0;
+}
+
+static int send_ws_binary_h2(h2_ctx_t *ctx, stream_t *s, const uint8_t *data, size_t len) {
+    (void)ctx;
+    uint8_t *fr = NULL;
+    size_t fr_len = 0;
+    if (encode_ws_binary(data, len, &fr, &fr_len) != 0) return -1;
+    int rv = queue_append(&s->to_edge, fr, fr_len, 0);
+    free(fr);
+    return rv;
+}
+
+typedef struct {
+    h2_ctx_t *ctx;
+    stream_t *stream;
+} ws_send_ctx_t;
+
+static int send_ws_binary_adapter(void *user_data, const uint8_t *data, size_t len) {
+    ws_send_ctx_t *w = user_data;
+    return send_ws_binary_h2(w->ctx, w->stream, data, len);
+}
+
+static int enqueue_origin_adapter(void *user_data, const uint8_t *data, size_t len, int datagram) {
+    stream_t *s = user_data;
+    if (s->to_origin.bytes + len > STREAM_QUEUE_HIGH) return -1;
+    return queue_append(&s->to_origin, data, len, datagram);
 }
 
 static int start_stream(h2_ctx_t *ctx, stream_t *s) {
@@ -544,6 +677,26 @@ static int start_stream(h2_ctx_t *ctx, stream_t *s) {
     int ws_mode = internal && strcasecmp(internal, "websocket") == 0;
     const route_t *hr = find_route(ctx->routes, ctx->route_count, host, ROUTE_HTTP);
     if (hr) {
+        if (path_matches_prefix(path, ctx->vless_path)) {
+            if (!ws_mode) {
+                s->kind = STREAM_REJECT;
+                return send_response(ctx, s, 404, NULL, 0, 1);
+            }
+            char *key = header_value(s->headers, s->header_count, "sec-websocket-key");
+            if (!key) {
+                s->kind = STREAM_REJECT;
+                return send_response(ctx, s, 404, NULL, 0, 1);
+            }
+            char accept[128];
+            websocket_accept(key, accept, sizeof(accept));
+            nghttp2_nv extra[] = {nv_lit("connection", "Upgrade"),
+                                  nv_lit("upgrade", "websocket"),
+                                  nv_lit("sec-websocket-accept", accept)};
+            s->kind = STREAM_VLESS;
+            fprintf(stderr, "vless path stream %d: /%s\n", s->id, ctx->vless_path);
+            return send_response(ctx, s, 200, extra, 3, 0);
+        }
+
         char ws_host[256], ws_port[16];
         int ws_path = parse_websockify_path(path, ctx->websockify_path, ws_host, sizeof(ws_host),
                                             ws_port, sizeof(ws_port));
@@ -655,10 +808,12 @@ static int on_data_chunk_recv_cb(nghttp2_session *session, uint8_t flags, int32_
     if (s->kind == STREAM_CONTROL) {
         if (s->ctrl_in_len + len > sizeof(s->ctrl_in)) {
             s->ctrl_in_len = 0;
+            nghttp2_session_consume(ctx->session, stream_id, len);
             return 0;
         }
         memcpy(s->ctrl_in + s->ctrl_in_len, data, len);
         s->ctrl_in_len += len;
+        nghttp2_session_consume(ctx->session, stream_id, len);
         for (;;) {
             size_t msg = capnp_wire_message_size(s->ctrl_in, s->ctrl_in_len);
             if (!msg) break;
@@ -683,15 +838,25 @@ static int on_data_chunk_recv_cb(nghttp2_session *session, uint8_t flags, int32_
             s->ctrl_in_len -= msg;
         }
     } else if (s->kind == STREAM_HTTP && s->origin_fd >= 0) {
-        send(s->origin_fd, data, len, MSG_NOSIGNAL);
+        s->h2_unconsumed += len;
+        if (s->to_origin.bytes + len > STREAM_QUEUE_HIGH) {
+            close(s->origin_fd);
+            s->origin_fd = -1;
+            maybe_consume_stream(ctx, s, 1);
+        } else {
+            queue_append(&s->to_origin, data, len, 0);
+            maybe_consume_stream(ctx, s, 0);
+        }
     } else if (s->kind == STREAM_CONFIG_UPDATE) {
         if (s->config_in_len + len > sizeof(s->config_in)) {
             fprintf(stderr, "configuration update too large; dropping buffer\n");
             s->config_in_len = 0;
+            nghttp2_session_consume(ctx->session, stream_id, len);
             return 0;
         }
         memcpy(s->config_in + s->config_in_len, data, len);
         s->config_in_len += len;
+        nghttp2_session_consume(ctx->session, stream_id, len);
         if (flags & NGHTTP2_FLAG_END_STREAM) {
             int version = 0;
             char err[256] = {0};
@@ -707,9 +872,11 @@ static int on_data_chunk_recv_cb(nghttp2_session *session, uint8_t flags, int32_
             }
             submit_data(ctx, s->id, (const uint8_t *)resp, strlen(resp), 1);
         }
-    } else if (s->kind == STREAM_WS && s->origin_fd >= 0) {
+    } else if (s->kind == STREAM_WS || s->kind == STREAM_VLESS) {
+        s->h2_unconsumed += len;
         if (s->ws_in_len + len > sizeof(s->ws_in)) {
             s->ws_in_len = 0;
+            maybe_consume_stream(ctx, s, 1);
             return 0;
         }
         memcpy(s->ws_in + s->ws_in_len, data, len);
@@ -721,16 +888,54 @@ static int on_data_chunk_recv_cb(nghttp2_session *session, uint8_t flags, int32_
             ssize_t n = ws_read_frame(s->ws_in, s->ws_in_len, &used, plain, sizeof(plain), &opcode);
             if (n == 0) break;
             if (n < 0 || opcode == 0x8) {
-                close(s->origin_fd);
-                s->origin_fd = -1;
+                if (s->origin_fd >= 0) {
+                    close(s->origin_fd);
+                    s->origin_fd = -1;
+                }
                 break;
             }
             if (opcode == 0x2 || opcode == 0x1 || opcode == 0x0) {
-                send(s->origin_fd, plain, (size_t)n, MSG_NOSIGNAL);
+                if (s->kind == STREAM_WS && s->origin_fd >= 0) {
+                    if (s->to_origin.bytes + (size_t)n > STREAM_QUEUE_HIGH ||
+                        queue_append(&s->to_origin, plain, (size_t)n, 0) != 0) {
+                        close(s->origin_fd);
+                        s->origin_fd = -1;
+                        break;
+                    }
+                } else if (s->kind == STREAM_VLESS) {
+                    ws_send_ctx_t ws_ctx = {.ctx = ctx, .stream = s};
+                    if (vless_handle_client_data(&s->vless, s->id, plain, (size_t)n,
+                                                 &s->origin_fd, enqueue_origin_adapter, s,
+                                                 send_ws_binary_adapter, &ws_ctx) != 0) {
+                        if (s->origin_fd >= 0) {
+                            close(s->origin_fd);
+                            s->origin_fd = -1;
+                        }
+                        break;
+                    }
+                }
             }
             memmove(s->ws_in, s->ws_in + used, s->ws_in_len - used);
             s->ws_in_len -= used;
         }
+        maybe_consume_stream(ctx, s, 0);
+    } else {
+        nghttp2_session_consume(ctx->session, stream_id, len);
+    }
+    return 0;
+}
+
+static int flush_tls_out(h2_ctx_t *ctx) {
+    while (ctx->tls_out.head) {
+        q_chunk_t *c = ctx->tls_out.head;
+        size_t left = c->len - c->off;
+        int n = SSL_write(ctx->ssl, c->data + c->off, (int)left);
+        if (n <= 0) {
+            int e = SSL_get_error(ctx->ssl, n);
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) return 0;
+            return -1;
+        }
+        queue_consume_head(&ctx->tls_out, (size_t)n);
     }
     return 0;
 }
@@ -740,14 +945,48 @@ static int send_pending(h2_ctx_t *ctx) {
     for (;;) {
         ssize_t len = nghttp2_session_mem_send(ctx->session, &data);
         if (len < 0) return -1;
-        if (len == 0) return 0;
-        size_t off = 0;
-        while (off < (size_t)len) {
-            int n = SSL_write(ctx->ssl, data + off, (int)((size_t)len - off));
-            if (n <= 0) return -1;
-            off += (size_t)n;
+        if (len == 0) break;
+        if (ctx->tls_out.bytes + (size_t)len > TLS_QUEUE_HIGH) return -1;
+        if (queue_append(&ctx->tls_out, data, (size_t)len, 0) != 0) return -1;
+        if (ctx->tls_out.bytes >= TLS_QUEUE_HIGH / 2) {
+            if (flush_tls_out(ctx) != 0) return -1;
+            if (ctx->tls_out.bytes >= TLS_QUEUE_HIGH / 2) break;
         }
     }
+    return flush_tls_out(ctx);
+}
+
+static int drain_edge_queues(h2_ctx_t *ctx) {
+    size_t submitted = 0;
+    for (stream_t *s = ctx->streams; s && submitted < EDGE_QUEUE_DRAIN_LIMIT; s = s->next) {
+        while (s->to_edge.head && submitted < EDGE_QUEUE_DRAIN_LIMIT) {
+            q_chunk_t *c = s->to_edge.head;
+            size_t left = c->len - c->off;
+            if (left > BUF_SIZE) left = BUF_SIZE;
+            if (submit_data(ctx, s->id, c->data + c->off, left, 0) != 0) {
+                fprintf(stderr, "dropping edge queue for closed stream %d\n", s->id);
+                queue_clear(&s->to_edge);
+                s->edge_eof_pending = 0;
+                if (s->origin_fd >= 0) {
+                    close(s->origin_fd);
+                    s->origin_fd = -1;
+                }
+                break;
+            }
+            queue_consume_head(&s->to_edge, left);
+            submitted += left;
+        }
+        if (!s->to_edge.head && s->edge_eof_pending && !s->eof_sent) {
+            if (submit_data(ctx, s->id, NULL, 0, 1) != 0) {
+                fprintf(stderr, "dropping EOF for closed stream %d\n", s->id);
+                s->edge_eof_pending = 0;
+                continue;
+            }
+            s->eof_sent = 1;
+            s->edge_eof_pending = 0;
+        }
+    }
+    return 0;
 }
 
 static void recv_edge_once(h2_ctx_t *ctx, SSL *ssl) {
@@ -841,114 +1080,131 @@ static int init_h2(h2_ctx_t *ctx) {
     nghttp2_session_callbacks_set_on_frame_recv_callback(cb, on_frame_recv_cb);
     nghttp2_session_callbacks_set_on_stream_close_callback(cb, on_stream_close_cb);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, on_data_chunk_recv_cb);
-    nghttp2_session_server_new(&ctx->session, cb, ctx);
+    nghttp2_option *option = NULL;
+    if (nghttp2_option_new(&option) != 0) {
+        nghttp2_session_callbacks_del(cb);
+        return -1;
+    }
+    nghttp2_option_set_no_auto_window_update(option, 1);
+    int rv = nghttp2_session_server_new2(&ctx->session, cb, ctx, option);
+    nghttp2_option_del(option);
     nghttp2_session_callbacks_del(cb);
+    if (rv != 0) return -1;
     nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 1024},
                                    {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 1024 * 1024}};
     return nghttp2_submit_settings(ctx->session, NGHTTP2_FLAG_NONE, iv, 2);
 }
 
-static void pump_origins(h2_ctx_t *ctx, struct pollfd *pfds, int base, int nfds) {
-    int idx = base;
-    for (stream_t *s = ctx->streams; s; s = s->next) {
-        if (s->origin_fd < 0) continue;
-        if (idx >= nfds) break;
+static void pump_origins(h2_ctx_t *ctx, struct pollfd *pfds, stream_t **poll_streams, int base,
+                         int nfds) {
+    for (int idx = base; idx < nfds; idx++) {
+        stream_t *s = poll_streams[idx];
+        if (!s || s->origin_fd < 0 || s->origin_fd != pfds[idx].fd) continue;
+
+        if ((pfds[idx].revents & POLLOUT) && s->to_origin.head) {
+            if (queue_flush_fd(&s->to_origin, s->origin_fd) != 0) {
+                close(s->origin_fd);
+                s->origin_fd = -1;
+                continue;
+            }
+            maybe_consume_stream(ctx, s, 0);
+        }
+
         if (pfds[idx].revents & (POLLIN | POLLHUP | POLLERR)) {
             uint8_t buf[BUF_SIZE];
             ssize_t n = recv(s->origin_fd, buf, sizeof(buf), 0);
             if (n > 0) {
-            if (s->kind == STREAM_WS) {
-                uint8_t *fr = NULL;
-                size_t fr_len = 0;
-                if (encode_ws_binary(buf, (size_t)n, &fr, &fr_len) == 0) {
-                    submit_data(ctx, s->id, fr, fr_len, 0);
-                    free(fr);
-                }
-            } else if (s->kind == STREAM_HTTP && !s->origin_headers_done) {
-                if (s->origin_in_len + (size_t)n > sizeof(s->origin_in)) {
-                    submit_data(ctx, s->id, NULL, 0, 1);
-                    s->eof_sent = 1;
-                    close(s->origin_fd);
-                    s->origin_fd = -1;
-                    idx++;
-                    continue;
-                }
-                memcpy(s->origin_in + s->origin_in_len, buf, (size_t)n);
-                s->origin_in_len += (size_t)n;
-                uint8_t *end = NULL;
-                for (size_t j = 3; j < s->origin_in_len; j++) {
-                    if (s->origin_in[j - 3] == '\r' && s->origin_in[j - 2] == '\n' &&
-                        s->origin_in[j - 1] == '\r' && s->origin_in[j] == '\n') {
-                        end = s->origin_in + j + 1;
-                        break;
+                if (s->kind == STREAM_WS) {
+                    send_ws_binary_h2(ctx, s, buf, (size_t)n);
+                } else if (s->kind == STREAM_VLESS) {
+                    ws_send_ctx_t ws_ctx = {.ctx = ctx, .stream = s};
+                    vless_send_origin_data(&s->vless, buf, (size_t)n, send_ws_binary_adapter,
+                                           &ws_ctx);
+                } else if (s->kind == STREAM_HTTP && !s->origin_headers_done) {
+                    if (s->origin_in_len + (size_t)n > sizeof(s->origin_in)) {
+                        submit_data(ctx, s->id, NULL, 0, 1);
+                        s->eof_sent = 1;
+                        close(s->origin_fd);
+                        s->origin_fd = -1;
+                        continue;
                     }
-                }
-                if (end) {
-                    size_t header_len = (size_t)(end - s->origin_in);
-                    char hdrbuf[BUF_SIZE * 4];
-                    memcpy(hdrbuf, s->origin_in, header_len);
-                    hdrbuf[header_len] = 0;
-                    scan_http_content_length(s, hdrbuf);
-                    size_t body_len = s->origin_in_len - header_len;
-                    if (!s->http_is_ws && s->http_has_content_length &&
-                        body_len > s->http_content_length) {
-                        body_len = s->http_content_length;
-                    }
-                    if (s->http_is_ws) {
-                        submit_h2_headers_from_http(ctx, s, hdrbuf, 1);
-                    } else {
-                        parse_http_status(s, hdrbuf);
-                        int done = s->http_has_content_length &&
-                                   body_len >= s->http_content_length;
-                        if (body_len) {
-                            submit_status_response_data(ctx, s, s->http_status,
-                                                        s->origin_in + header_len, body_len, done);
-                            s->http_body_sent += body_len;
-                        } else if (s->http_has_content_length && s->http_content_length == 0) {
-                            submit_status_response_data(ctx, s, s->http_status, NULL, 0, 1);
-                            done = 1;
-                        }
-                        if (done) {
-                            s->eof_sent = 1;
-                            close(s->origin_fd);
-                            s->origin_fd = -1;
+                    memcpy(s->origin_in + s->origin_in_len, buf, (size_t)n);
+                    s->origin_in_len += (size_t)n;
+                    uint8_t *end = NULL;
+                    for (size_t j = 3; j < s->origin_in_len; j++) {
+                        if (s->origin_in[j - 3] == '\r' && s->origin_in[j - 2] == '\n' &&
+                            s->origin_in[j - 1] == '\r' && s->origin_in[j] == '\n') {
+                            end = s->origin_in + j + 1;
+                            break;
                         }
                     }
-                    s->origin_headers_done = 1;
-                    s->origin_in_len = 0;
-                }
-            } else if (s->kind == STREAM_HTTP && !s->http_is_ws && s->http_has_content_length) {
-                size_t remaining = s->http_content_length - s->http_body_sent;
-                size_t send_len = (size_t)n < remaining ? (size_t)n : remaining;
-                s->http_body_sent += send_len;
-                int done = s->http_body_sent >= s->http_content_length;
-                if (!s->response_started) {
-                    submit_status_response_data(ctx, s, s->http_status ? s->http_status : 200, buf,
-                                                send_len, done);
-                } else if (send_len || done) {
-                    submit_data(ctx, s->id, buf, send_len, done);
-                }
-                if (done) {
-                    s->eof_sent = 1;
+                    if (end) {
+                        size_t header_len = (size_t)(end - s->origin_in);
+                        char hdrbuf[BUF_SIZE * 4];
+                        memcpy(hdrbuf, s->origin_in, header_len);
+                        hdrbuf[header_len] = 0;
+                        scan_http_content_length(s, hdrbuf);
+                        size_t body_len = s->origin_in_len - header_len;
+                        if (!s->http_is_ws && s->http_has_content_length &&
+                            body_len > s->http_content_length) {
+                            body_len = s->http_content_length;
+                        }
+                        if (s->http_is_ws) {
+                            submit_h2_headers_from_http(ctx, s, hdrbuf, 1);
+                        } else {
+                            parse_http_status(s, hdrbuf);
+                            int done =
+                                s->http_has_content_length && body_len >= s->http_content_length;
+                            if (body_len) {
+                                submit_status_response_data(ctx, s, s->http_status,
+                                                            s->origin_in + header_len, body_len,
+                                                            done);
+                                s->http_body_sent += body_len;
+                            } else if (s->http_has_content_length && s->http_content_length == 0) {
+                                submit_status_response_data(ctx, s, s->http_status, NULL, 0, 1);
+                                done = 1;
+                            }
+                            if (done) {
+                                s->eof_sent = 1;
+                                close(s->origin_fd);
+                                s->origin_fd = -1;
+                            }
+                        }
+                        s->origin_headers_done = 1;
+                        s->origin_in_len = 0;
+                    }
+                } else if (s->kind == STREAM_HTTP && !s->http_is_ws &&
+                           s->http_has_content_length) {
+                    size_t remaining = s->http_content_length - s->http_body_sent;
+                    size_t send_len = (size_t)n < remaining ? (size_t)n : remaining;
+                    s->http_body_sent += send_len;
+                    int done = s->http_body_sent >= s->http_content_length;
+                    if (!s->response_started) {
+                        submit_status_response_data(ctx, s, s->http_status ? s->http_status : 200,
+                                                    buf, send_len, done);
+                    } else if (send_len || done) {
+                        submit_data(ctx, s->id, buf, send_len, done);
+                    }
+                    if (done) {
+                        s->eof_sent = 1;
+                        close(s->origin_fd);
+                        s->origin_fd = -1;
+                    }
+                } else if (queue_append(&s->to_edge, buf, (size_t)n, 0) != 0) {
                     close(s->origin_fd);
                     s->origin_fd = -1;
                 }
-            } else {
-                submit_data(ctx, s->id, buf, (size_t)n, 0);
-            }
             } else if (!s->eof_sent) {
-                submit_data(ctx, s->id, NULL, 0, 1);
-                s->eof_sent = 1;
+                s->edge_eof_pending = 1;
                 close(s->origin_fd);
                 s->origin_fd = -1;
             }
         }
-        idx++;
     }
 }
 
 int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count,
-                const char *websockify_path) {
+                const char *websockify_path, const char *vless_path) {
     SSL_library_init();
     SSL_load_error_strings();
     signal(SIGPIPE, SIG_IGN);
@@ -972,6 +1228,7 @@ int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count
     ctx.route_capacity = MAX_ROUTES;
     ctx.token = *token;
     ctx.websockify_path = websockify_path;
+    ctx.vless_path = vless_path;
     ctx.control_stream_id = -1;
     uuid_v4(ctx.client_id);
     if (init_h2(&ctx) != 0) return 1;
@@ -986,21 +1243,32 @@ int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count
         for (stream_t *s = ctx.streams; s && count < 256; s = s->next)
             if (s->origin_fd >= 0) count++;
         struct pollfd pfds[256];
+        stream_t *poll_streams[256];
+        memset(poll_streams, 0, sizeof(poll_streams));
         pfds[0].fd = edge_fd;
-        pfds[0].events = POLLIN;
+        pfds[0].events = POLLIN | (ctx.tls_out.head ? POLLOUT : 0);
+        poll_streams[0] = NULL;
         int i = 1;
         for (stream_t *s = ctx.streams; s && i < 256; s = s->next) {
             if (s->origin_fd >= 0) {
                 pfds[i].fd = s->origin_fd;
-                pfds[i].events = POLLIN;
+                pfds[i].events = (s->to_edge.bytes < STREAM_QUEUE_HIGH ? POLLIN : 0) |
+                                 (s->to_origin.head ? POLLOUT : 0);
+                poll_streams[i] = s;
                 i++;
             }
         }
         int pr = poll(pfds, i, 1000);
         if (pr < 0) {
             if (errno == EINTR) continue;
+            fprintf(stderr, "poll failed: %s\n", strerror(errno));
             break;
         }
+        if ((pfds[0].revents & POLLOUT) && flush_tls_out(&ctx) != 0) {
+            fprintf(stderr, "failed to flush TLS output\n");
+            break;
+        }
+        pump_origins(&ctx, pfds, poll_streams, 1, i);
         if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             uint8_t buf[BUF_SIZE];
             int n = SSL_read(ssl, buf, sizeof(buf));
@@ -1012,11 +1280,21 @@ int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count
                 }
             } else {
                 int e = SSL_get_error(ssl, n);
-                if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) break;
+                if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
+                    fprintf(stderr, "edge SSL_read failed: ssl_error=%d n=%d errno=%d\n", e, n,
+                            errno);
+                    break;
+                }
             }
         }
-        pump_origins(&ctx, pfds, 1, i);
-        if (send_pending(&ctx) != 0) break;
+        if (drain_edge_queues(&ctx) != 0) {
+            fprintf(stderr, "failed to drain stream edge queues\n");
+            break;
+        }
+        if (send_pending(&ctx) != 0) {
+            fprintf(stderr, "failed to send pending h2/TLS data\n");
+            break;
+        }
     }
 
     if (g_shutdown_requested) graceful_shutdown_control(&ctx, edge_fd);
@@ -1024,5 +1302,6 @@ int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count
     nghttp2_session_del(ctx.session);
     SSL_free(ssl);
     SSL_CTX_free(ssl_ctx);
+    queue_clear(&ctx.tls_out);
     return 0;
 }

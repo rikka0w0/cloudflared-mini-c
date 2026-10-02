@@ -140,6 +140,24 @@ int tcp_connect_host(const char *host, const char *port) {
     return fd;
 }
 
+int udp_connect_host(const char *host, const char *port) {
+    struct addrinfo hints, *res = NULL, *rp;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_family = AF_UNSPEC;
+    if (getaddrinfo(host, port, &hints, &res) != 0) return -1;
+    int fd = -1;
+    for (rp = res; rp; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
 int set_nonblock(int fd, bool nonblock) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
@@ -224,4 +242,3 @@ int ws_write_binary(int fd, const uint8_t *data, size_t len) {
     if (write(fd, hdr, h) != (ssize_t)h) return -1;
     return write(fd, data, len) == (ssize_t)len ? 0 : -1;
 }
-

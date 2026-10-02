@@ -9,6 +9,7 @@ int parse_route_arg(route_method_t method, const char *arg, route_t *out);
 const route_t *find_route(const route_t *routes, size_t route_count, const char *domain,
                           route_method_t preferred);
 int tcp_connect_host(const char *host, const char *port);
+int udp_connect_host(const char *host, const char *port);
 int set_nonblock(int fd, bool nonblock);
 void uuid_v4(uint8_t out[16]);
 char *header_value(h2_header_t *headers, size_t count, const char *name);
