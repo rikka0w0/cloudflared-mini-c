@@ -24,6 +24,7 @@ jobs:
 
       - name: Build static binary
         run: |
+          set -euo pipefail
           make -j"$(nproc)" \
             TARGET=x86_64-linux-gnu \
             OPENSSL_TARGET=linux-x86_64 \
@@ -50,6 +51,11 @@ jobs:
             -w /work \
             quay.io/pypa/manylinux_2_28_i686 \
             /bin/bash -lc '
+              set -euo pipefail
+              dnf install -y glibc-static
+              test -f "$(gcc -print-file-name=libc.a)"
+              test -f "$(gcc -print-file-name=libpthread.a)"
+              test -f "$(gcc -print-file-name=libdl.a)"
               make -j"$(nproc)" \
                 TARGET=i686-linux-gnu \
                 OPENSSL_TARGET=linux-x86 \
@@ -74,6 +80,7 @@ jobs:
 
       - name: Download OpenWrt toolchain
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/openwrt"
           curl -L "$TOOLCHAIN_URL" -o "$RUNNER_TEMP/openwrt/toolchain.tar.zst"
           tar --zstd -xf "$RUNNER_TEMP/openwrt/toolchain.tar.zst" -C "$RUNNER_TEMP/openwrt"
@@ -81,6 +88,7 @@ jobs:
 
       - name: Build static binary
         run: |
+          set -euo pipefail
           TOOLCHAIN_DIR="$(find "$RUNNER_TEMP/openwrt" -maxdepth 1 -type d -name 'openwrt-toolchain-*' | head -n1)"
           GCC_PATH="$(find "$TOOLCHAIN_DIR" -path '*/bin/*-openwrt-linux-musl-gcc' | head -n1)"
           if [ -z "$GCC_PATH" ]; then
@@ -118,6 +126,7 @@ jobs:
 
       - name: List release files
         run: |
+          set -euo pipefail
           ls -lh dist
           file dist/*
 
