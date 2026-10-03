@@ -1235,7 +1235,7 @@ static void pump_origins(h2_ctx_t *ctx, struct pollfd *pfds, stream_t **poll_str
     }
 }
 
-static int run_edge_h2_once(const tunnel_token_t *token, route_t *routes, size_t route_count,
+static int run_edge_h2_once(const tunnel_token_t *token, route_t *routes, size_t *route_count,
                             const char *websockify_path, const char *vless_path) {
     SSL_CTX *ssl_ctx = NULL;
     SSL *ssl = NULL;
@@ -1250,7 +1250,7 @@ static int run_edge_h2_once(const tunnel_token_t *token, route_t *routes, size_t
     memset(&ctx, 0, sizeof(ctx));
     ctx.ssl = ssl;
     ctx.routes = routes;
-    ctx.route_count = route_count;
+    ctx.route_count = route_count ? *route_count : 0;
     ctx.route_capacity = MAX_ROUTES;
     ctx.token = *token;
     ctx.websockify_path = websockify_path;
@@ -1339,20 +1339,24 @@ static int run_edge_h2_once(const tunnel_token_t *token, route_t *routes, size_t
     SSL_CTX_free(ssl_ctx);
     queue_clear(&ctx.tls_out);
     clear_streams(&ctx);
+    if (route_count) *route_count = ctx.route_count;
     return g_shutdown_requested ? 0 : 1;
 }
 
-int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count,
-                const char *websockify_path, const char *vless_path) {
+int run_edge_h2(const tunnel_token_t *token, const char *websockify_path, const char *vless_path) {
     SSL_library_init();
     SSL_load_error_strings();
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_shutdown_signal);
     signal(SIGTERM, handle_shutdown_signal);
 
+    route_t routes[MAX_ROUTES];
+    size_t route_count = 0;
+    memset(routes, 0, sizeof(routes));
+
     int backoff = 1;
     while (!g_shutdown_requested) {
-        int rc = run_edge_h2_once(token, routes, route_count, websockify_path, vless_path);
+        int rc = run_edge_h2_once(token, routes, &route_count, websockify_path, vless_path);
         if (g_shutdown_requested || rc == 0) break;
 
         fprintf(stderr, "edge connection ended; reconnecting in %d seconds\n", backoff);

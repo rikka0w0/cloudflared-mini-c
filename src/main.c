@@ -27,8 +27,6 @@ int main(int argc, char **argv) {
     const char *token_s = NULL;
     const char *websockify_path = NULL;
     const char *vless_path = NULL;
-    route_t routes[MAX_ROUTES];
-    size_t route_count = 0;
 
     for (int i = 5; i < argc; i++) {
         if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
@@ -56,5 +54,5 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "loaded token: account=%s secret_len=%zu\n", token.account_tag,
             token.tunnel_secret_len);
-    return run_edge_h2(&token, routes, route_count, websockify_path, vless_path);
+    return run_edge_h2(&token, websockify_path, vless_path);
 }
