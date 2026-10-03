@@ -23,6 +23,7 @@
 #define STREAM_QUEUE_LOW (1024 * 1024)
 #define EDGE_QUEUE_DRAIN_LIMIT (256 * 1024)
 #define TLS_QUEUE_HIGH (4 * 1024 * 1024)
+#define RECONNECT_BACKOFF_MAX 30
 
 typedef enum {
     STREAM_NEW,
@@ -216,6 +217,19 @@ static void remove_stream(h2_ctx_t *ctx, int32_t id) {
         }
         pp = &s->next;
     }
+}
+
+static void clear_streams(h2_ctx_t *ctx) {
+    stream_t *s = ctx->streams;
+    while (s) {
+        stream_t *next = s->next;
+        if (s->origin_fd >= 0) close(s->origin_fd);
+        queue_clear(&s->to_origin);
+        queue_clear(&s->to_edge);
+        free(s);
+        s = next;
+    }
+    ctx->streams = NULL;
 }
 
 static ssize_t data_read_cb(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
@@ -1221,14 +1235,8 @@ static void pump_origins(h2_ctx_t *ctx, struct pollfd *pfds, stream_t **poll_str
     }
 }
 
-int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count,
-                const char *websockify_path, const char *vless_path) {
-    SSL_library_init();
-    SSL_load_error_strings();
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT, handle_shutdown_signal);
-    signal(SIGTERM, handle_shutdown_signal);
-
+static int run_edge_h2_once(const tunnel_token_t *token, route_t *routes, size_t route_count,
+                            const char *websockify_path, const char *vless_path) {
     SSL_CTX *ssl_ctx = NULL;
     SSL *ssl = NULL;
     int edge_fd = tls_connect_edge(&ssl_ctx, &ssl);
@@ -1249,8 +1257,17 @@ int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count
     ctx.vless_path = vless_path;
     ctx.control_stream_id = -1;
     uuid_v4(ctx.client_id);
-    if (init_h2(&ctx) != 0) return 1;
-    send_pending(&ctx);
+    if (init_h2(&ctx) != 0) {
+        fprintf(stderr, "failed to initialize h2 session\n");
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        return 1;
+    }
+    if (send_pending(&ctx) != 0) {
+        fprintf(stderr, "failed to send initial h2 settings\n");
+        ctx.stopping = 1;
+    }
 
     while (!ctx.stopping) {
         if (g_shutdown_requested) {
@@ -1321,5 +1338,29 @@ int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count
     SSL_free(ssl);
     SSL_CTX_free(ssl_ctx);
     queue_clear(&ctx.tls_out);
+    clear_streams(&ctx);
+    return g_shutdown_requested ? 0 : 1;
+}
+
+int run_edge_h2(const tunnel_token_t *token, route_t *routes, size_t route_count,
+                const char *websockify_path, const char *vless_path) {
+    SSL_library_init();
+    SSL_load_error_strings();
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, handle_shutdown_signal);
+    signal(SIGTERM, handle_shutdown_signal);
+
+    int backoff = 1;
+    while (!g_shutdown_requested) {
+        int rc = run_edge_h2_once(token, routes, route_count, websockify_path, vless_path);
+        if (g_shutdown_requested || rc == 0) break;
+
+        fprintf(stderr, "edge connection ended; reconnecting in %d seconds\n", backoff);
+        for (int waited = 0; waited < backoff && !g_shutdown_requested; waited++) sleep(1);
+        if (backoff < RECONNECT_BACKOFF_MAX) {
+            backoff *= 2;
+            if (backoff > RECONNECT_BACKOFF_MAX) backoff = RECONNECT_BACKOFF_MAX;
+        }
+    }
     return 0;
 }
